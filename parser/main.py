@@ -6,7 +6,7 @@ import json
 import traceback
 from loguru import logger
 from db import DB
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, OFFSET_END
 from model.parser import Parser
 from parsers import generate_parsers
 
@@ -21,6 +21,34 @@ def process_msg(obj, topic, parsers_map, db):
     return handled
 
 
+def process_cache_event(obj, topic, cache_parsers_map, db):
+    op = obj.get('__op')
+    if op not in ('c', 'u'):
+        return
+    for parser in cache_parsers_map.get(topic, []):
+        try:
+            parser.on_cache_event(obj, db)
+        except Exception as e:
+            logger.error(f"Failed to apply cache event on {parser.__class__.__name__}: {e}")
+
+
+def unique_parsers(parsers_dict):
+    seen = set()
+    for parser_list in parsers_dict.values():
+        for parser in parser_list:
+            if id(parser) not in seen:
+                seen.add(id(parser))
+                yield parser
+
+
+def build_cache_topics_map(parsers_dict):
+    cache_map = {}
+    for parser in unique_parsers(parsers_dict):
+        for t in parser.cache_topics():
+            cache_map.setdefault(t, []).append(parser)
+    return cache_map
+
+
 if __name__ == "__main__":
     group_id = os.environ.get("KAFKA_GROUP_ID")
     commit_batch_size = int(os.environ.get("COMMIT_BATCH_SIZE", "100"))
@@ -30,6 +58,8 @@ if __name__ == "__main__":
     max_processed_items = int(os.environ.get("MAX_PROCESSED_ITEMS", '1000000'))
     # idle commit timer — flush partial batch when upstream is quiet, so consumer lag drains on indexer stop
     commit_interval = int(os.environ.get("COMMIT_INTERVAL", '600'))
+    # timer fallback for parser cache reload — safety net against missed Kafka cache events
+    cache_reload_interval = int(os.environ.get("PARSER_CACHE_RELOAD_SEC", '3600'))
     supported_parsers = os.environ.get("SUPPORTED_PARSERS", "*")
     # to avoid race conditions we will process messages with maturity greater than MIN_MATURITY_SECONDS
     min_maturity = int(os.environ.get("MIN_MATURITY_SECONDS", "0")) * 1000
@@ -89,13 +119,39 @@ if __name__ == "__main__":
             'enable.auto.commit': False,
             'max.poll.interval.ms': int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", '300000')),
         })
-        topic_list = topics.split(",")
-        logger.info(f"Subscribing to {topic_list}")
-        consumer.subscribe(topic_list)
+        cache_parsers_map = build_cache_topics_map(PARSERS)
+        cache_topics_set = set(cache_parsers_map.keys())
+        topic_list = list(set(topics.split(",")) | cache_topics_set)
+        logger.info(f"Subscribing to {topic_list} (cache topics: {sorted(cache_topics_set) or 'none'})")
+
+        def on_assign(consumer, partitions):
+            # For cache topics: use committed offset if we have one (rebalance resumes cleanly);
+            # only fall back to OFFSET_END on first-ever assign (no committed → historical entries
+            # are already in prepare() snapshot, timer reload catches any subsequent gaps).
+            for p in partitions:
+                if p.topic in cache_topics_set:
+                    committed = consumer.committed([p], timeout=5)[0]
+                    if committed.offset < 0:
+                        p.offset = OFFSET_END
+            consumer.assign(partitions)
+
+        consumer.subscribe(topic_list, on_assign=on_assign)
 
         last_commit_at = time.time()
+        # Start timer such that first tick fires quickly — closes gap between prepare() snapshot
+        # and consumer subscribe (any cache events landed in that window are picked up).
+        last_cache_reload_at = time.time() - cache_reload_interval + 60
 
         while True:
+            # Timer-based cache reload — safety net against missed Kafka events / cold-start dead loops.
+            # Runs independently of predicate, so cache-only-predicate parsers cannot get stuck at cache=0.
+            if time.time() - last_cache_reload_at > cache_reload_interval:
+                for parser in unique_parsers(PARSERS):
+                    try:
+                        parser.reload_cache(db)
+                    except Exception as e:
+                        logger.error(f"reload_cache failed on {parser.__class__.__name__}: {e}")
+                last_cache_reload_at = time.time()
             # Idle commit check — fires even when poll returns None, so lag drains when upstream is quiet.
             # Time-based trigger uses kafka_batch (not db.updated) so it also drains streams where
             # most messages are filtered out and never produce DB writes.
@@ -122,16 +178,20 @@ if __name__ == "__main__":
                 continue
 
             try:
-                _ts_type, ts_ms = msg.timestamp()
-                if ts_ms and min_maturity and ts_ms > time.time() * 1000 - min_maturity:
-                    wait_interval_ms = ts_ms - time.time() * 1000 + min_maturity + 100
-                    logger.info(f"Waiting for {wait_interval_ms / 1000:0.1f} s before processing next message, timestamp {ts_ms}, partition {msg.partition()}")
-                    time.sleep(wait_interval_ms / 1000)
-
                 total += 1
                 kafka_batch += 1
                 obj = json.loads(msg.value().decode("utf-8"))
-                successful += process_msg(obj, msg.topic(), PARSERS, db)
+                if msg.topic() in cache_topics_set:
+                    # Cache events must NOT wait for maturity — they need to arrive in the cache
+                    # as early as possible, ahead of the state events that depend on them.
+                    process_cache_event(obj, msg.topic(), cache_parsers_map, db)
+                else:
+                    _ts_type, ts_ms = msg.timestamp()
+                    if ts_ms and min_maturity and ts_ms > time.time() * 1000 - min_maturity:
+                        wait_interval_ms = ts_ms - time.time() * 1000 + min_maturity + 100
+                        logger.info(f"Waiting for {wait_interval_ms / 1000:0.1f} s before processing next message, timestamp {ts_ms}, partition {msg.partition()}")
+                        time.sleep(wait_interval_ms / 1000)
+                    successful += process_msg(obj, msg.topic(), PARSERS, db)
                 now = time.time()
                 if now - last > log_interval:
                     logger.info(f"{1.0 * total / (now - last):0.2f} Kafka messages per second ({total} processed), {100.0 * successful / total:0.2f}% handled")

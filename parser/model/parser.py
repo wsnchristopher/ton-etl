@@ -78,7 +78,16 @@ class Parser:
                 print(f"Non critical error during handling object {obj}: {e}")
                 return False
         return False
-    
+
+    def cache_topics(self):
+        return []
+
+    def on_cache_event(self, obj, db: DB):
+        pass
+
+    def reload_cache(self, db: DB):
+        pass
+
     """
     Helper method to convert uint values to int
     """

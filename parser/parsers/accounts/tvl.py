@@ -1,5 +1,4 @@
 import copy
-import time
 from typing import Dict
 from loguru import logger
 from db import DB
@@ -9,6 +8,7 @@ from model.dexswap import DEX_DEDUST, DEX_MEGATON, DEX_STON, DEX_STON_V2, DEX_TO
 from model.dedust import read_dedust_asset
 from model.coffee import read_coffee_asset
 from parsers.message.swap_volume import estimate_tvl
+from parsers.utils import decode_decimal
 from pytvm.tvm_emulator.tvm_emulator import TvmEmulator
 from parsers.accounts.emulator import EmulatorException, EmulatorParser
 
@@ -20,17 +20,46 @@ Listens to updates on DEX pools, exrtacts reserves and total_supply
 and estimates TVL.
 """
 class TVLPoolStateParser(EmulatorParser):
-    def __init__(self, emulator_path, update_interval=3600):
+    def __init__(self, emulator_path):
         super().__init__(emulator_path)
-        self.last_updated = int(time.time())
-        # update intervals for pools
-        self.update_interval = update_interval
         self.pools: Dict[str, DexPool] = {}
 
     def prepare(self, db: DB):
         super().prepare(db)
+        self.reload_cache(db)
+
+    def reload_cache(self, db: DB):
+        prev_len = len(self.pools)
         self.pools = db.get_all_dex_pools()
-        logger.info(f"Found {len(self.pools)} unique dex pools to handle")
+        delta = len(self.pools) - prev_len
+        logger.info(f"Reloaded dex pools cache: {len(self.pools)} pools ({delta:+d})")
+
+    def cache_topics(self):
+        return ["ton.prices.dex_pool"]
+
+    def on_cache_event(self, obj, db: DB):
+        pool_addr = obj.get('pool')
+        if not pool_addr:
+            return
+        was_new = pool_addr not in self.pools
+        self.pools[pool_addr] = DexPool(
+            pool=pool_addr,
+            platform=obj.get('platform'),
+            jetton_left=Address(obj['jetton_left']) if obj.get('jetton_left') else None,
+            jetton_right=Address(obj['jetton_right']) if obj.get('jetton_right') else None,
+            reserves_left=decode_decimal(obj['reserves_left']) if obj.get('reserves_left') else None,
+            reserves_right=decode_decimal(obj['reserves_right']) if obj.get('reserves_right') else None,
+            total_supply=decode_decimal(obj['total_supply']) if obj.get('total_supply') else None,
+            tvl_usd=decode_decimal(obj['tvl_usd']) if obj.get('tvl_usd') else None,
+            tvl_ton=decode_decimal(obj['tvl_ton']) if obj.get('tvl_ton') else None,
+            last_updated=obj.get('last_updated'),
+            is_liquid=obj['is_liquid'] if obj.get('is_liquid') is not None else True,
+            lp_fee=decode_decimal(obj['lp_fee']) if obj.get('lp_fee') else None,
+            protocol_fee=decode_decimal(obj['protocol_fee']) if obj.get('protocol_fee') else None,
+            referral_fee=decode_decimal(obj['referral_fee']) if obj.get('referral_fee') else None,
+        )
+        if was_new:
+            logger.info(f"Cache event added pool {pool_addr} ({obj.get('platform')})")
 
     def predicate(self, obj) -> bool:
         if super().predicate(obj):
@@ -38,7 +67,6 @@ class TVLPoolStateParser(EmulatorParser):
         return False
     
     def _do_parse(self, obj, db: DB, emulator: TvmEmulator):
-        # TODO refresh pool data every update_interval
         pool = self.pools[obj['account']]
         pool.last_updated = obj['timestamp']
 
@@ -224,10 +252,3 @@ class TVLPoolStateParser(EmulatorParser):
         estimate_tvl(pool, db)
         logger.info(pool)
         db.update_dex_pool_state(pool)
-
-        if int(time.time()) > self.last_updated + self.update_interval:
-            logger.info("Updating dex pools")
-            prev_len = len(self.pools)
-            self.pools = db.get_all_dex_pools()
-            logger.info(f"Found {len(self.pools) - prev_len} new dex pools to handle")
-            self.last_updated = int(time.time())
