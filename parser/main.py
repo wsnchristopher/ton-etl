@@ -6,7 +6,7 @@ import json
 import traceback
 from loguru import logger
 from db import DB
-from confluent_kafka import Consumer, KafkaError, OFFSET_END
+from confluent_kafka import Consumer, KafkaError, OFFSET_END, TopicPartition
 from model.parser import Parser
 from parsers import generate_parsers
 
@@ -112,30 +112,45 @@ if __name__ == "__main__":
         db.release()
         logger.info("PROCESS_* mode complete")
     else:
+        broker = os.environ.get("KAFKA_BROKER")
         consumer = Consumer({
             'group.id': group_id,
-            'bootstrap.servers': os.environ.get("KAFKA_BROKER"),
+            'bootstrap.servers': broker,
             'auto.offset.reset': os.environ.get("KAFKA_OFFSET_RESET", 'earliest'),
             'enable.auto.commit': False,
             'max.poll.interval.ms': int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", '300000')),
         })
         cache_parsers_map = build_cache_topics_map(PARSERS)
         cache_topics_set = set(cache_parsers_map.keys())
-        topic_list = list(set(topics.split(",")) | cache_topics_set)
-        logger.info(f"Subscribing to {topic_list} (cache topics: {sorted(cache_topics_set) or 'none'})")
+        event_topics = list(set(topics.split(",")))
+        logger.info(f"Subscribing (event) to {event_topics}; cache topics (broadcast): {sorted(cache_topics_set) or 'none'}")
+        consumer.subscribe(event_topics)
 
-        def on_assign(consumer, partitions):
-            # For cache topics: use committed offset if we have one (rebalance resumes cleanly);
-            # only fall back to OFFSET_END on first-ever assign (no committed → historical entries
-            # are already in prepare() snapshot, timer reload catches any subsequent gaps).
-            for p in partitions:
-                if p.topic in cache_topics_set:
-                    committed = consumer.committed([p], timeout=5)[0]
-                    if committed.offset < 0:
-                        p.offset = OFFSET_END
-            consumer.assign(partitions)
-
-        consumer.subscribe(topic_list, on_assign=on_assign)
+        # Cache consumer — broadcast pattern via assign() to all partitions of all cache topics.
+        # Every pod in a replica set sees every cache event, independent of partition assignment
+        # of the main consumer group. No group coordination for cache — offsets are not persisted,
+        # startup begins at OFFSET_END (prepare() snapshot covers historical state), timer reload
+        # is the safety net for anything missed while the pod was down.
+        cache_consumer = None
+        if cache_topics_set:
+            cache_consumer = Consumer({
+                'group.id': f"cache-broadcast-{os.environ.get('HOSTNAME', 'unknown')}",
+                'bootstrap.servers': broker,
+                'enable.auto.commit': False,
+            })
+            all_tps = []
+            for topic in cache_topics_set:
+                md = cache_consumer.list_topics(topic, timeout=10).topics.get(topic)
+                if md is None or md.error is not None:
+                    logger.warning(f"Cache topic {topic} metadata unavailable, skipping")
+                    continue
+                for partition in md.partitions.keys():
+                    all_tps.append(TopicPartition(topic, partition, OFFSET_END))
+            if all_tps:
+                cache_consumer.assign(all_tps)
+                logger.info(f"Cache consumer assigned to {len(all_tps)} partitions across {sorted(cache_topics_set)}")
+            else:
+                cache_consumer = None
 
         last_commit_at = time.time()
         # Start timer such that first tick fires quickly — closes gap between prepare() snapshot
@@ -168,6 +183,24 @@ if __name__ == "__main__":
                 kafka_batch = 0
                 last_commit_at = time.time()
 
+            # Drain any pending cache events first (non-blocking) so they land ahead of
+            # the state events that depend on them. Cache events are rare, so this loop
+            # exits quickly in normal operation.
+            if cache_consumer is not None:
+                while True:
+                    cache_msg = cache_consumer.poll(timeout=0)
+                    if cache_msg is None:
+                        break
+                    if cache_msg.error():
+                        if cache_msg.error().code() != KafkaError._PARTITION_EOF:
+                            logger.error(f"Cache consumer error: {cache_msg.error()}")
+                        break
+                    try:
+                        cache_obj = json.loads(cache_msg.value().decode("utf-8"))
+                        process_cache_event(cache_obj, cache_msg.topic(), cache_parsers_map, db)
+                    except Exception as e:
+                        logger.error(f"Failed to process cache item {cache_msg}: {e} {traceback.format_exc()}")
+
             msg = consumer.poll(timeout=1.0)
             if msg is None:
                 continue
@@ -181,17 +214,12 @@ if __name__ == "__main__":
                 total += 1
                 kafka_batch += 1
                 obj = json.loads(msg.value().decode("utf-8"))
-                if msg.topic() in cache_topics_set:
-                    # Cache events must NOT wait for maturity — they need to arrive in the cache
-                    # as early as possible, ahead of the state events that depend on them.
-                    process_cache_event(obj, msg.topic(), cache_parsers_map, db)
-                else:
-                    _ts_type, ts_ms = msg.timestamp()
-                    if ts_ms and min_maturity and ts_ms > time.time() * 1000 - min_maturity:
-                        wait_interval_ms = ts_ms - time.time() * 1000 + min_maturity + 100
-                        logger.info(f"Waiting for {wait_interval_ms / 1000:0.1f} s before processing next message, timestamp {ts_ms}, partition {msg.partition()}")
-                        time.sleep(wait_interval_ms / 1000)
-                    successful += process_msg(obj, msg.topic(), PARSERS, db)
+                _ts_type, ts_ms = msg.timestamp()
+                if ts_ms and min_maturity and ts_ms > time.time() * 1000 - min_maturity:
+                    wait_interval_ms = ts_ms - time.time() * 1000 + min_maturity + 100
+                    logger.info(f"Waiting for {wait_interval_ms / 1000:0.1f} s before processing next message, timestamp {ts_ms}, partition {msg.partition()}")
+                    time.sleep(wait_interval_ms / 1000)
+                successful += process_msg(obj, msg.topic(), PARSERS, db)
                 now = time.time()
                 if now - last > log_interval:
                     logger.info(f"{1.0 * total / (now - last):0.2f} Kafka messages per second ({total} processed), {100.0 * successful / total:0.2f}% handled")
