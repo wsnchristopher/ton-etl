@@ -34,9 +34,6 @@ class TVLPoolStateParser(EmulatorParser):
         delta = len(self.pools) - prev_len
         logger.info(f"Reloaded dex pools cache: {len(self.pools)} pools ({delta:+d})")
 
-    def cache_topics(self):
-        return ["ton.prices.dex_pool"]
-
     def on_cache_event(self, obj, db: DB):
         pool_addr = obj.get('pool')
         if not pool_addr:

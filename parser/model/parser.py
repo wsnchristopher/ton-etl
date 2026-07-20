@@ -80,7 +80,8 @@ class Parser:
         return False
 
     def cache_topics(self):
-        return []
+        raw = os.environ.get("KAFKA_CACHE_TOPICS", "").strip()
+        return [t.strip() for t in raw.split(",") if t.strip()]
 
     def on_cache_event(self, obj, db: DB):
         pass
