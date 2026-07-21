@@ -34,7 +34,7 @@ class ConfigCellHolder:
     def get(self):
         if getattr(self, '_CONFIG_CELL', None) is None:
             logger.info("Initing config cell from the blockchain")
-            asyncio.run(self._get_cell())
+            asyncio.run(asyncio.wait_for(self._get_cell(), timeout=30))
             logger.info("Config cell initialized")
         return self._CONFIG_CELL
     
@@ -139,7 +139,7 @@ class EmulatorParser(Parser):
             missing_library = result['missing_library']
 
             logger.warning(f"Got missing library {missing_library}: {result}")
-            lib = asyncio.run(self.get_lib(missing_library))
+            lib = asyncio.run(asyncio.wait_for(self.get_lib(missing_library), timeout=30))
             if not lib:
                 logger.error(f"Failed to get library {missing_library}")
                 raise EmulatorException(f"Library {missing_library} not found")
